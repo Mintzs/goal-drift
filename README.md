@@ -17,7 +17,7 @@
 
 ***
 
-When an AI agent is prompt-injected, it doesn't crash — it quietly starts doing something else. **goal-drift** catches that.
+When an AI agent is prompt-injected, it doesn't crash: it quietly starts doing something else. **goal-drift** catches that.
 
 It works by locking the user's original goal as an embedding at session start, then scoring every tool call against that goal using cosine similarity. If the agent suddenly tries to forward emails to an attacker, exfiltrate data, or call tools that have nothing to do with the task, goal-drift can flag it, block it, or activate human-in-the-loop interaction before execution.
 
