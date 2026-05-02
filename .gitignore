@@ -1,0 +1,4 @@
+# Ignore local instruction files and env secrets
+AGENTS.md
+.env
+examples/.env
