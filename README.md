@@ -1,6 +1,6 @@
 <div align="center">
 
-# goal-drift
+# 💨 goal-drift
 
 **Prompt injection detection for LLM agents via semantic goal drift monitoring**
 
