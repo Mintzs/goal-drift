@@ -2,3 +2,7 @@
 AGENTS.md
 .env
 examples/.env
+
+# Python cache artifacts
+__pycache__/
+*.pyc
