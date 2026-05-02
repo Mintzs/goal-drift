@@ -1,6 +1,11 @@
+
+<p align="center">
+  <img width="100" height="100" alt="goal-drift icon" src="https://github.com/user-attachments/assets/1581aacd-6644-4a8c-8b79-0156b38b40e2" />
+</p>
+
 <div align="center">
 
-# 💨 goal-drift
+# goal-drift
 
 **Prompt injection detection for LLM agents via semantic goal drift monitoring**
 
